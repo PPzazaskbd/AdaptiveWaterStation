@@ -15,7 +15,11 @@ This is a embedded system final project by group 67 "ขอ A Diglo". The projec
 ## Role
 
 System Architect & Integration: 6833123021 Thiraphat Pholboon
+
 Embedded Developer (Sensor Node): 6833071021 Napat Putsorn
+
 Embedded Developer (Gateway & Cloud): 6833166021 Pannawit Wanitsuwan
+
 UI/UX & Dashboard Developer: 6833099621 Thipakon Phangbudda
+
 Project Manager & Test Lead: 6833219621 Poopet Suppatsat
