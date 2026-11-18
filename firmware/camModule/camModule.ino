@@ -22,6 +22,8 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+bool cameraReady = false;
+
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -59,6 +61,11 @@ bool initCamera() {
 }
 
 void sendPhotoOverSerial() {
+  if (!cameraReady) {
+    Serial.write("ERR!", 4);
+    return;
+  }
+
   // Flush stale frame and grab fresh frame
   camera_fb_t* stale = esp_camera_fb_get();
   if (stale) esp_camera_fb_return(stale);
@@ -92,17 +99,26 @@ void sendPhotoOverSerial() {
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   setCpuFrequencyMhz(80); // Low ~85mA draw — Wi-Fi stays 100% OFF!
-  Serial.begin(230400);
+  Serial.begin(115200);   // Matched to WROOM Serial2 (115200 baud)
 
-  if (!initCamera()) {
-    while (1) delay(1000);
-  }
+  cameraReady = initCamera();
 }
 
 void loop() {
   if (Serial.available()) {
     char cmd = Serial.read();
-    if (cmd == 'C') { // 'C' = Capture request from ESP32-S3
+
+    if (cmd == 'P') { 
+      // Diagnostic Ping from WROOM
+      if (cameraReady) {
+        Serial.print("PONG");
+      } else {
+        Serial.print("CAM_INIT_FAIL");
+      }
+      Serial.flush();
+    } 
+    else if (cmd == 'C' || cmd == 'c') { 
+      // Capture request from WROOM
       sendPhotoOverSerial();
     }
   }
