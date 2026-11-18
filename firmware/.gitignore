@@ -1,0 +1,7 @@
+# Wi-Fi passwords, device certificates and private keys
+secrets.h
+*.pem
+*.pem.key
+*.pem.crt
+*.key
+build/
