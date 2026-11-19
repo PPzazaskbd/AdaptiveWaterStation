@@ -2,72 +2,68 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DHT.h>
-#define DHTPIN 32        // DHT11 Data pin connected to GPIO 5
-#define DHTTYPE DHT11     // Defining the sensor type as DHT11
-DHT dht(DHTPIN, DHTTYPE); // Initialize the DHT object
+#include <HX711.h>
+#include "secrets.h"
+#include <StationCloud.h>
 
-float airHumidity = 0.0;  // Stores the relative humidity percentage
-float airTemp = 0.0;      // Optional: Stores temperature in Celsius
+// --- PIN DEFINITIONS (ESP32-WROOM) ---
+#define DHTPIN 32
+#define DHTTYPE DHT11
+const int SENSOR_PIN_OBSTACLE = 4;  // T447 IR obstacle sensor
+const int SENSOR_PIN_FLOW     = 19; // YF-S401 Flow sensor yellow wire
+const int LOADCELL_DOUT_PIN   = 25; // HX711 DT pin
+const int LOADCELL_SCK_PIN    = 26; // HX711 SCK pin
 
-const int SENSOR_PIN_OBSTACLE = 4; //T447 IR obstacle sensor on GPIO 4
-const int SENSOR_PIN_FLOW = 19;    // [YF-S401] Yellow signal wire on GPIO 19
+DHT dht(DHTPIN, DHTTYPE);
+HX711 scale;
 WebServer server(80);
 
-volatile bool sensorChanged = false; //sensor change check
-volatile unsigned long lastTriggerTime = 0; //timestamp of the last sensor trigger
-const unsigned long DEBOUNCE_DELAY = 150; //debouncing
-bool obstaclePresent = false;  //check for object (obstacle)
+// --- CLIMATE STATE ---
+float airHumidity = NAN;
+float airTemp = NAN;
+
+// --- OBSTACLE & SESSION STATE ---
+bool obstaclePresent = false;
 unsigned long bottleCount = 0;
 
-// [YF-S401] Flow sensor state variables (98 pulses/sec = 1 L/min = 5880 pulses/Liter)
-volatile unsigned long flowPulseCount = 0;
+// --- YF-S401 FLOW SENSOR STATE ---
+volatile unsigned long totalFlowPulses = 0; // Cumulative since boot for cloudSetFlowPulses()
+unsigned long lastSecondPulses = 0;
+unsigned long sessionStartPulses = 0;
 float flowRateLmin = 0.0;
 float totalWaterML = 0.0;
 unsigned long lastFlowRead = 0;
-const float YFS401_FACTOR = 98.0;
+const float YFS401_FACTOR = 98.0; // 98 Hz = 1 L/min (5880 pulses/L)
 
-bool leakdetected = true;
+// --- 1KG LOAD CELL (HX711) STATE ---
+float currentMassGrams = 0.0;
+long currentMassRaw = 0;
+float CAL_FACTOR_GRAMS = 420.0; // Adjust during calibration with a known weight
 
-//Image settings
-const size_t MAX_JPG = 40000; 
+// --- CAMERA STATE ---
+const size_t MAX_JPG = 40000;
 uint8_t* latestBottleJpg = nullptr;
 size_t latestBottleLen = 0;
-
-//Camera operational status
 bool cameraHealthy = false;
 
-void IRAM_ATTR handleSensorInterrupt() {
-  unsigned long now = millis();
-  if (now - lastTriggerTime > DEBOUNCE_DELAY) {
-    sensorChanged = true;
-    lastTriggerTime = now;
-  }
-}
-
-// [YF-S401] Counts every rotor pulse in hardware
+// [YF-S401] Hardware Interrupt: counts every pulse since boot
 void IRAM_ATTR handleFlowInterrupt() {
-  flowPulseCount++;
+  totalFlowPulses++;
 }
 
-// Sends a lightweight 'P' (Ping) command to see if the Camera is alive and responsive
+// Sends 'P' (Ping) to verify ESP32-CAM is responsive
 bool checkCameraStatus() {
-  // Flush any UART buffer noise
   while (Serial2.available()) Serial2.read();
-
   Serial.println("[DIAGNOSTIC] Sending Ping ('P') to ESP32-CAM...");
-  Serial2.write('P'); // 'P' for Ping
+  Serial2.write('P');
 
   unsigned long start = millis();
   String response = "";
-  
-  // Wait up to 1.5 seconds for "PONG" response from camera
   while (millis() - start < 1500) {
     if (Serial2.available()) {
       char c = Serial2.read();
       response += c;
-      if (response.indexOf("PONG") != -1) {
-        return true;
-      }
+      if (response.indexOf("PONG") != -1) return true;
     }
   }
   return false;
@@ -76,7 +72,7 @@ bool checkCameraStatus() {
 // Requests a JPEG frame from ESP-32S CAM over Serial2 (RX2=16, TX2=17)
 bool requestPhotoFromCam(uint8_t* destBuf, size_t* destLen) {
   if (!destBuf) return false;
-  while (Serial2.available()) Serial2.read(); 
+  while (Serial2.available()) Serial2.read();
 
   Serial.println("[CAM] Sending 'C' command to ESP32-CAM...");
   Serial2.write('C');
@@ -84,7 +80,6 @@ bool requestPhotoFromCam(uint8_t* destBuf, size_t* destLen) {
   unsigned long start = millis();
   int match = 0;
   const char* hdr = "JPG!";
-  
   while (millis() - start < 3000) {
     if (Serial2.available()) {
       char c = Serial2.read();
@@ -121,22 +116,24 @@ void sendJpeg(const uint8_t* buf, size_t len) {
 
 void handleRoot() {
   String statusText = obstaclePresent ? "BOTTLE PRESENT (Filling)" : "CLEAR (Standby)";
-  String camStatusText = cameraHealthy ? "<span style='color:#28a745;'>ONLINE</span>" : "<span style='color:#dc3545;'>OFFLINE (Check Serial Monitor)</span>";
-  
+  String camStatusText = cameraHealthy ? "<span style='color:#28a745;'>ONLINE</span>" : "<span style='color:#dc3545;'>OFFLINE</span>";
+  String awsStatusText = cloudConnected() ? "<span style='color:#28a745;'>CONNECTED</span>" : "<span style='color:#ffc107;'>BUFFERING (" + String(cloudBuffered()) + ")</span>";
+
   String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<style>body{font-family:sans-serif;text-align:center;background:#111;color:#eee;padding:20px;}"
                 "img{width:320px;max-width:100%;border-radius:8px;border:2px solid #444;margin:10px 0;}"
-                ".status-card{background:#222;padding:12px 16px;border-radius:8px;margin:8px;border:1px solid #333;min-width:140px;}"
+                ".status-card{background:#222;padding:12px 16px;border-radius:8px;margin:8px;border:1px solid #333;min-width:130px;}"
                 "button{padding:10px 18px;font-size:16px;border-radius:6px;cursor:pointer;background:#007bff;color:white;border:none;margin:5px;}</style></head><body>"
-                "<h2>Smart Water Dispenser Dashboard (ESP32-WROOM)</h2>"
+                "<h2>Smart Water Dispenser (WROOM + AWS IoT)</h2>"
+                "<p>AWS Cloud: <b>" + awsStatusText + "</b> | Camera: <b>" + camStatusText + "</b></p>"
                 "<div style='display:flex; justify-content:center; flex-wrap:wrap;'>"
-                  "<div class='status-card'>Ambient Humidity<br><b style='font-size:24px; color:#00d2fc;'>" + String(airHumidity, 1) + "%</b></div>"
-                  "<div class='status-card'>Temperature<br><b style='font-size:24px; color:#ff7b00;'>" + String(airTemp, 1) + "°C</b></div>"
-                  "<div class='status-card'>Flow Rate<br><b style='font-size:24px; color:#00ff88;'>" + String(flowRateLmin, 2) + " L/min</b></div>"
-                  "<div class='status-card'>Water Dispensed<br><b style='font-size:24px; color:#ffc107;'>" + String(totalWaterML, 1) + " mL</b></div>"
+                  "<div class='status-card'>Humidity<br><b style='font-size:22px; color:#00d2fc;'>" + (isnan(airHumidity) ? "--" : String(airHumidity, 1) + "%") + "</b></div>"
+                  "<div class='status-card'>Temperature<br><b style='font-size:22px; color:#ff7b00;'>" + (isnan(airTemp) ? "--" : String(airTemp, 1) + "&deg;C") + "</b></div>"
+                  "<div class='status-card'>Flow Rate<br><b style='font-size:22px; color:#00ff88;'>" + String(flowRateLmin, 2) + " L/min</b></div>"
+                  "<div class='status-card'>Dispensed<br><b style='font-size:22px; color:#ffc107;'>" + String(totalWaterML, 1) + " mL</b></div>"
+                  "<div class='status-card'>Bottle Mass<br><b style='font-size:22px; color:#e83e8c;'>" + String(currentMassGrams, 1) + " g</b></div>"
                 "</div>"
-                "<p>Camera Status: <b>" + camStatusText + "</b></p>"
-                "<p>Sensor Status: <b>" + statusText + "</b> | Total Bottles: <b>" + String(bottleCount) + "</b></p>"
+                "<p>Bay Status: <b>" + statusText + "</b> | Total Bottles: <b>" + String(bottleCount) + "</b></p>"
                 "<h3>Latest Snapshot</h3>";
 
   if (latestBottleLen == 0) {
@@ -144,9 +141,10 @@ void handleRoot() {
   } else {
     html += "<img src='/latest.jpg?t=" + String(millis()) + "'><br><br>";
   }
-  
-  html += "<button onclick=\"location.reload()\">Refresh Dashboard</button>"
-          "<button style='background:#444;' onclick=\"location.href='/reset_flow'\">Reset Water mL</button>"
+
+  html += "<button onclick=\"location.reload()\">Refresh</button>"
+          "<button style='background:#444;' onclick=\"location.href='/reset_flow'\">Reset mL</button>"
+          "<button style='background:#28a745;' onclick=\"location.href='/tare'\">Tare Scale (0g)</button>"
           "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -159,10 +157,17 @@ void handleLatestJpg() {
   sendJpeg(latestBottleJpg, latestBottleLen);
 }
 
-// [YF-S401] Web endpoint to zero out dispensed mL
 void handleResetFlow() {
   totalWaterML = 0.0;
-  Serial.println("[FLOW] Water volume reset to 0 mL.");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleTare() {
+  if (scale.is_ready()) {
+    scale.tare();
+    Serial.println("[SCALE] Load cell tared to 0.0 g!");
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -170,143 +175,126 @@ void handleResetFlow() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  
+
   Serial2.begin(115200, SERIAL_8N1, 16, 17); // RX2=16, TX2=17
   Serial2.setTimeout(2500);
 
   latestBottleJpg = (uint8_t*)malloc(MAX_JPG);
 
+  // Initialize sensors
   dht.begin(15);
   pinMode(SENSOR_PIN_OBSTACLE, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN_OBSTACLE), handleSensorInterrupt, CHANGE);
-  obstaclePresent = (digitalRead(SENSOR_PIN_OBSTACLE) == LOW);
-
-  // [YF-S401] Initialize flow sensor interrupt on GPIO 19
   pinMode(SENSOR_PIN_FLOW, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN_FLOW), handleFlowInterrupt, FALLING);
   lastFlowRead = millis();
 
-  // --- CONNECT TO WIFI ---
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WIFI] Connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Initialize 1kg Load Cell (HX711 on GPIO 25 / 26)
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(CAL_FACTOR_GRAMS);
+  if (scale.wait_ready_timeout(500)) {
+    scale.tare();
+    Serial.println("[SCALE] HX711 Load Cell Ready & Tared to 0g!");
+  } else {
+    Serial.println("[SCALE WARN] HX711 not detected yet (check GPIO 25/26 wiring).");
   }
-  Serial.println("\nWi-Fi Connected!");
+
+  // --- START WIFI, CLOCK & AWS IOT CORE (via StationCloud) ---
+  Serial.println("[CLOUD] Starting Wi-Fi, SNTP, and AWS IoT Core...");
+  cloudBegin(THINGNAME, WIFI_SSID, WIFI_PASSWORD, AWS_IOT_ENDPOINT,
+             AWS_CERT_CA, AWS_CERT_CRT, AWS_CERT_PRIVATE);
+
   Serial.print("OPEN DASHBOARD IN BROWSER: http://");
   Serial.println(WiFi.localIP());
-  Serial.println("-------------------------------------------------");
 
   // --- CAMERA DIAGNOSTIC CHECK ---
-  Serial.println("[DIAGNOSTIC] Initiating Camera System Check...");
   cameraHealthy = checkCameraStatus();
-
-  if (cameraHealthy) {
-    Serial.println("[DIAGNOSTIC SUCCESS] ESP32-CAM is ONLINE and communicating cleanly!");
-    Serial.println("Type 'c' and press Enter to snap a manual test picture anytime.");
-  } else {
-    Serial.println("[DIAGNOSTIC WARNING] ESP32-CAM is OFFLINE!");
-    Serial.println("   Please inspect your physical wires:");
-    Serial.println("   1. WROOM Pin 17 -> CAM Pin U0R");
-    Serial.println("   2. WROOM Pin 16 -> CAM Pin U0T");
-    Serial.println("   3. WROOM GND    -> CAM GND (Next to 5V pin)");
-    Serial.println("   4. Verify the Camera has red power LEDs lit!");
-    Serial.println("   (Camera command 'c' is locked until a connection is established)\n");
-  }
-  Serial.println("-------------------------------------------------");
+  cloudFaultIf("CAM_FAULT", !cameraHealthy);
 
   server.on("/", handleRoot);
   server.on("/latest.jpg", handleLatestJpg);
-  server.on("/reset_flow", handleResetFlow); // [YF-S401] Reset route
+  server.on("/reset_flow", handleResetFlow);
+  server.on("/tare", handleTare);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+  cloudLoop(); // Reconnects, sends heartbeat, flushes QoS 1 buffer
 
-  // [YF-S401] Calculate flow rate (L/min) and volume (mL) every 1000ms
+  // 1. Bottle Presence Guard (replaces noisy edge interrupts for AWS)
+  CloudPresence edge = cloudBottleSeen(digitalRead(SENSOR_PIN_OBSTACLE) == LOW);
+  if (edge == CLOUD_BOTTLE_ARRIVED) {
+    obstaclePresent = true;
+    bottleCount++;
+    sessionStartPulses = totalFlowPulses;
+    Serial.printf("\n[SENSOR] Bottle #%lu Confirmed (1s)! Requesting snapshot...\n", bottleCount);
+
+    if (cameraHealthy) {
+      bool ok = requestPhotoFromCam(latestBottleJpg, &latestBottleLen);
+      cloudFaultIf("CAM_FAULT", !ok);
+    }
+  } else if (edge == CLOUD_BOTTLE_LEFT) {
+    obstaclePresent = false;
+    Serial.println("[SENSOR] Bottle Removed (SUMMARY queued to AWS).");
+  }
+
+  // 2. Flow Sensor + Load Cell update every 1000ms
   unsigned long now = millis();
   if (now - lastFlowRead >= 1000) {
     unsigned long elapsed = now - lastFlowRead;
     lastFlowRead = now;
 
     noInterrupts();
-    unsigned long pulses = flowPulseCount;
-    flowPulseCount = 0;
+    unsigned long currentTotalPulses = totalFlowPulses;
     interrupts();
 
-    float hz = (pulses * 1000.0f) / (float)elapsed;
+    unsigned long deltaPulses = currentTotalPulses - lastSecondPulses;
+    lastSecondPulses = currentTotalPulses;
+
+    float hz = (deltaPulses * 1000.0f) / (float)elapsed;
     flowRateLmin = hz / YFS401_FACTOR;
-    totalWaterML += (pulses * 1000.0f) / (YFS401_FACTOR * 60.0f);
+    totalWaterML += (deltaPulses * 1000.0f) / (YFS401_FACTOR * 60.0f);
 
-    if (pulses > 0) {
-      Serial.printf("[FLOW] Rate: %.2f L/min | Total: %.1f mL (%lu pulses)\n",
-                    flowRateLmin, totalWaterML, pulses);
-    } else {
-      flowRateLmin = 0.0;
+    // Send cumulative pulses to StationCloud
+    cloudSetFlowPulses(currentTotalPulses);
+
+    // Non-blocking HX711 Load Cell read
+    if (scale.is_ready()) {
+      currentMassRaw = scale.read();
+      currentMassGrams = scale.get_units(1);
+      cloudSetMass(currentMassGrams, currentMassRaw);
+    }
+
+    if (deltaPulses > 0) {
+      Serial.printf("[FLOW] Rate: %.2f L/min | Total: %.1f mL | Mass: %.1f g\n",
+                    flowRateLmin, totalWaterML, currentMassGrams);
     }
   }
 
-  //Check for leakage
+  // 3. Climate (DHT11) update every 2.5 seconds
   static unsigned long lastDHTRead = 0;
-  if (millis() - lastDHTRead > 2500) {
-    lastDHTRead = millis();
-
-    float h = dht.readHumidity();
-    float t = dht.readTemperature(); // Read temperature in Celsius
-
-    // If reading succeeded, update global variables
-    if (!isnan(h) && !isnan(t)) {
-      airHumidity = h;
-      airTemp = t;
-    } else {
-      Serial.println("[WARN] Failed to read from DHT11 sensor!");
-    }
+  if (now - lastDHTRead > 2500) {
+    lastDHTRead = now;
+    airHumidity = dht.readHumidity();
+    airTemp = dht.readTemperature();
+    cloudSetClimate(airTemp, airHumidity); // NAN is automatically handled as null + SHT_FAULT
   }
 
-  // Monitor Serial input for commands
+  // 4. Serial Monitor manual commands ('c' = photo, 't' = tare scale, 'r' = reset flow)
   if (Serial.available()) {
     char key = Serial.read();
     if (key == 'c' || key == 'C') {
-      if (!cameraHealthy) {
-        Serial.println("[LOCKED] Cannot capture. Camera system diagnostic failed at boot.");
-        Serial.println("Checking camera connection again...");
-        cameraHealthy = checkCameraStatus();
-        if (cameraHealthy) {
-          Serial.println("Camera is now ONLINE! Try pressing 'c' again.");
-        } else {
-          Serial.println("Camera is still OFFLINE. Check wiring crossed pins (TX->RX, RX->TX).");
-        }
-      } else {
-        Serial.println("\n--- [MANUAL TRIGGER] Capturing snapshot ---");
-        requestPhotoFromCam(latestBottleJpg, &latestBottleLen);
+      cameraHealthy = checkCameraStatus();
+      cloudFaultIf("CAM_FAULT", !cameraHealthy);
+      if (cameraHealthy) requestPhotoFromCam(latestBottleJpg, &latestBottleLen);
+    } else if (key == 't' || key == 'T') {
+      if (scale.is_ready()) {
+        scale.tare();
+        Serial.println("[SCALE] Tared to 0.0 g!");
       }
     } else if (key == 'r' || key == 'R') {
-      // [YF-S401] Manual reset from Serial Monitor
       totalWaterML = 0.0;
-      Serial.println("[FLOW] Reset total water volume to 0 mL.");
-    }
-  }
-
-  // IR Sensor processing
-  if (sensorChanged) {
-    sensorChanged = false;
-    bool current = (digitalRead(SENSOR_PIN_OBSTACLE) == LOW);
-    if (current != obstaclePresent) {
-      obstaclePresent = current;
-      if (obstaclePresent) {
-        bottleCount++;
-        Serial.printf("\n[SENSOR] Bottle #%lu Detected! Requesting snapshot...\n", bottleCount);
-        if (cameraHealthy) {
-          requestPhotoFromCam(latestBottleJpg, &latestBottleLen);
-        } else {
-          Serial.println("[SENSOR ERROR] Skipping photo trigger - Camera is offline.");
-        }
-      } else {
-        Serial.println("[SENSOR] Bottle Removed.");
-      }
+      Serial.println("[FLOW] Reset total water mL to 0.");
     }
   }
 }
