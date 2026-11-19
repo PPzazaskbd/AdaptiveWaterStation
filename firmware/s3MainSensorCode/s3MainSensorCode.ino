@@ -9,10 +9,8 @@ DHT dht(DHTPIN, DHTTYPE); // Initialize the DHT object
 float airHumidity = 0.0;  // Stores the relative humidity percentage
 float airTemp = 0.0;      // Optional: Stores temperature in Celsius
 
-const char* WIFI_SSID = "YOUR WIFI SSID";
-const char* WIFI_PASS = "YOUR PASSWORD";
-
 const int SENSOR_PIN_OBSTACLE = 4; //T447 IR obstacle sensor on GPIO 4
+const int SENSOR_PIN_FLOW = 19;    // [YF-S401] Yellow signal wire on GPIO 19
 WebServer server(80);
 
 volatile bool sensorChanged = false; //sensor change check
@@ -20,6 +18,13 @@ volatile unsigned long lastTriggerTime = 0; //timestamp of the last sensor trigg
 const unsigned long DEBOUNCE_DELAY = 150; //debouncing
 bool obstaclePresent = false;  //check for object (obstacle)
 unsigned long bottleCount = 0;
+
+// [YF-S401] Flow sensor state variables (98 pulses/sec = 1 L/min = 5880 pulses/Liter)
+volatile unsigned long flowPulseCount = 0;
+float flowRateLmin = 0.0;
+float totalWaterML = 0.0;
+unsigned long lastFlowRead = 0;
+const float YFS401_FACTOR = 98.0;
 
 bool leakdetected = true;
 
@@ -37,6 +42,11 @@ void IRAM_ATTR handleSensorInterrupt() {
     sensorChanged = true;
     lastTriggerTime = now;
   }
+}
+
+// [YF-S401] Counts every rotor pulse in hardware
+void IRAM_ATTR handleFlowInterrupt() {
+  flowPulseCount++;
 }
 
 // Sends a lightweight 'P' (Ping) command to see if the Camera is alive and responsive
@@ -116,18 +126,19 @@ void handleRoot() {
   String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<style>body{font-family:sans-serif;text-align:center;background:#111;color:#eee;padding:20px;}"
                 "img{width:320px;max-width:100%;border-radius:8px;border:2px solid #444;margin:10px 0;}"
-                "button{padding:10px 18px;font-size:16px;border-radius:6px;cursor:pointer;background:#007bff;color:white;border:none;}</style></head><body>"
+                ".status-card{background:#222;padding:12px 16px;border-radius:8px;margin:8px;border:1px solid #333;min-width:140px;}"
+                "button{padding:10px 18px;font-size:16px;border-radius:6px;cursor:pointer;background:#007bff;color:white;border:none;margin:5px;}</style></head><body>"
                 "<h2>Smart Water Dispenser Dashboard (ESP32-WROOM)</h2>"
                 "<div style='display:flex; justify-content:center; flex-wrap:wrap;'>"
                   "<div class='status-card'>Ambient Humidity<br><b style='font-size:24px; color:#00d2fc;'>" + String(airHumidity, 1) + "%</b></div>"
                   "<div class='status-card'>Temperature<br><b style='font-size:24px; color:#ff7b00;'>" + String(airTemp, 1) + "°C</b></div>"
+                  "<div class='status-card'>Flow Rate<br><b style='font-size:24px; color:#00ff88;'>" + String(flowRateLmin, 2) + " L/min</b></div>"
+                  "<div class='status-card'>Water Dispensed<br><b style='font-size:24px; color:#ffc107;'>" + String(totalWaterML, 1) + " mL</b></div>"
                 "</div>"
                 "<p>Camera Status: <b>" + camStatusText + "</b></p>"
                 "<p>Sensor Status: <b>" + statusText + "</b> | Total Bottles: <b>" + String(bottleCount) + "</b></p>"
-                "<h3>Latest Snapshot</h3>"
-                ;
+                "<h3>Latest Snapshot</h3>";
 
-                
   if (latestBottleLen == 0) {
     html += "<p style='color:#888;'>No photo captured yet.</p>";
   } else {
@@ -135,6 +146,7 @@ void handleRoot() {
   }
   
   html += "<button onclick=\"location.reload()\">Refresh Dashboard</button>"
+          "<button style='background:#444;' onclick=\"location.href='/reset_flow'\">Reset Water mL</button>"
           "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -145,6 +157,14 @@ void handleLatestJpg() {
     return;
   }
   sendJpeg(latestBottleJpg, latestBottleLen);
+}
+
+// [YF-S401] Web endpoint to zero out dispensed mL
+void handleResetFlow() {
+  totalWaterML = 0.0;
+  Serial.println("[FLOW] Water volume reset to 0 mL.");
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 void setup() {
@@ -160,6 +180,11 @@ void setup() {
   pinMode(SENSOR_PIN_OBSTACLE, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN_OBSTACLE), handleSensorInterrupt, CHANGE);
   obstaclePresent = (digitalRead(SENSOR_PIN_OBSTACLE) == LOW);
+
+  // [YF-S401] Initialize flow sensor interrupt on GPIO 19
+  pinMode(SENSOR_PIN_FLOW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN_FLOW), handleFlowInterrupt, FALLING);
+  lastFlowRead = millis();
 
   // --- CONNECT TO WIFI ---
   WiFi.mode(WIFI_STA);
@@ -194,11 +219,35 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/latest.jpg", handleLatestJpg);
+  server.on("/reset_flow", handleResetFlow); // [YF-S401] Reset route
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+
+  // [YF-S401] Calculate flow rate (L/min) and volume (mL) every 1000ms
+  unsigned long now = millis();
+  if (now - lastFlowRead >= 1000) {
+    unsigned long elapsed = now - lastFlowRead;
+    lastFlowRead = now;
+
+    noInterrupts();
+    unsigned long pulses = flowPulseCount;
+    flowPulseCount = 0;
+    interrupts();
+
+    float hz = (pulses * 1000.0f) / (float)elapsed;
+    flowRateLmin = hz / YFS401_FACTOR;
+    totalWaterML += (pulses * 1000.0f) / (YFS401_FACTOR * 60.0f);
+
+    if (pulses > 0) {
+      Serial.printf("[FLOW] Rate: %.2f L/min | Total: %.1f mL (%lu pulses)\n",
+                    flowRateLmin, totalWaterML, pulses);
+    } else {
+      flowRateLmin = 0.0;
+    }
+  }
 
   //Check for leakage
   static unsigned long lastDHTRead = 0;
@@ -234,6 +283,10 @@ void loop() {
         Serial.println("\n--- [MANUAL TRIGGER] Capturing snapshot ---");
         requestPhotoFromCam(latestBottleJpg, &latestBottleLen);
       }
+    } else if (key == 'r' || key == 'R') {
+      // [YF-S401] Manual reset from Serial Monitor
+      totalWaterML = 0.0;
+      Serial.println("[FLOW] Reset total water volume to 0 mL.");
     }
   }
 
