@@ -1,0 +1,9 @@
+{
+  "name": "embedded-running-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Snapshot of the user-verified EC2 API; run export-running-backend.ps1 to copy its source files",
+  "engines": { "node": ">=24" },
+  "scripts": { "start": "node server.cjs" },
+  "dependencies": { "pg": "^8.0.0" }
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=Embedded project backend
+After=network.target
+
+[Service]
+Type=simple
+User=embedded-backend
+Group=embedded-backend
+WorkingDirectory=/opt/embedded-backend
+ExecStart=/usr/local/bin/node /opt/embedded-backend/server.cjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
