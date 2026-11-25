@@ -1,0 +1,33 @@
+# Dependencies and local database test data
+**/node_modules/
+/backend/test-runtime/pg-test-*/
+
+# Credentials, private keys, local configuration and backups
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+**/database.json*
+**/gateway-api-key
+**/dashboard-origins.json
+**/backup-api-*/
+*.before-*
+*.dump
+*.backup
+.aws/
+.ssh/
+Password/
+
+# Downloaded diagnostic copies, not the team's frontend source
+/checkpoint/dashboard-public.html
+/checkpoint/dashboard-route.html
+/checkpoint/dashboard-response-headers.txt
+/checkpoint/dashboard-chunk-*.js
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.log

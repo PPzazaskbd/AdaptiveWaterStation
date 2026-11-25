@@ -1,0 +1,7 @@
+﻿{
+    "port":  5432,
+    "host":  "YOUR_RDS_ENDPOINT",
+    "database":  "embedded",
+    "user":  "YOUR_DATABASE_USER",
+    "password":  "SET_ON_SERVER_ONLY"
+}

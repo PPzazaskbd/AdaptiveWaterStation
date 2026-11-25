@@ -1,0 +1,7 @@
+node_modules/
+bridge.json
+*.crt
+*.pem
+*.key
+secrets.h
+*.log
